@@ -1,6 +1,6 @@
 # pi-session-modify 设计文档
 
-> 状态：设计阶段，尚未实现
+> 状态：已实现（`/psm-edit` 与 `/psm-remove` 可用），未常驻安装
 > 参考版本：pi 1.4.0（`~/.pi/agent/install/releases/1.4.0/`）
 > 所有"事实"条目均已通过读源码或解包 npm 包核实；"未验证"条目会显式标注。
 
@@ -599,7 +599,65 @@ start    = clamp(selectedIndex - floor(window / 2), 0, len - window)
 
 ---
 
-## 10. 参考：被检查过的第三方包
+## 10. 实现
+
+### 10.1 目录结构
+
+```
+pi-session-modify/
+├── index.ts                 扩展入口：default export → registerCommands(pi)
+├── package.json             peerDependencies 声明宿主提供的 pi 包；devDependencies 仅供 tsc
+├── tsconfig.json            noEmit / allowImportingTsExtensions / erasableSyntaxOnly
+├── src/
+│   ├── commands.ts          两命令：前置检查 → 选目标 → 收集新文本/确认 → 改写 → 重载
+│   ├── ui.ts                窗口化单选列表（ctx.ui.custom）
+│   ├── items.ts             列表行构造：editableItems / turnItems
+│   ├── messages.ts          textOf / preview / roleLabel（纯函数）
+│   └── session-file.ts      session JSONL 外科手术（全同步）
+└── test/
+    ├── session-file.test.ts 10 项
+    └── items.test.ts        2 项
+```
+
+`@earendil-works/pi-coding-agent` 与 `@earendil-works/pi-tui` 只在 `peerDependencies` 里声明 `"*"`，**不能放 `dependencies`**（`core/resource-loader.ts:53-97` 会告警；且 jiti 的 alias `core/extensions/loader.ts:102-125` 会把这两个 specifier 映射到宿主自己的模块）。devDependencies 里的同名包只用于 `tsc` 解析类型，运行时走 alias，不会被加载。
+
+### 10.2 开发命令
+
+```bash
+npm install          # 只为 tsc / node --test
+npm run check        # tsc --noEmit
+npm test             # node --test test/*.test.ts
+
+pi --session <file> --extension /root/pi-session-modify/index.ts   # 临时加载
+ln -s /root/pi-session-modify ~/.pi/agent/extensions/session-modify  # 常驻
+```
+
+### 10.3 实现约定
+
+1. **全同步写入**：`session-file.ts` 里所有导出函数都是同步的。命令里 await 只发生在弹窗阶段；进入写入阶段后不再让出事件循环。
+2. **只重序列化必要行**：编辑只改目标行，删除只改被删行与被重连行；其余行按原字符串写回。
+3. **日志先行**：`psm-log` 先 append，再写 tmp，再 rename；日志多一条比少一条安全。
+4. **写后重读校验**：重新解析整份文件，校验条目数、id 集合、所有 `parentId` 可解析。
+5. **失败不回滚**：任何异常都中止且不碰原文件；`switchSession` 失败时文件已改，只能告知用户。
+
+### 10.4 验证记录
+
+- `npx tsc --noEmit`：0 错误（TypeScript 5.9.3）
+- `node --test test/*.test.ts`：12 项全绿
+- 真机 e2e（tmux + 手造 session，2 轮 5 条消息）：
+  - `/psm-edit` → 选助手消息 → 编辑器预填原文 → 追加文字 → Enter → 文件只变 `a2` 一行（`thinking` 块保留）、日志记录 `originalLine`、界面整屏重画后显示新文本
+  - `/psm-remove` → 选第二轮 → 确认 → 文件删 3 条消息、`thinking_level_change` 保留并重连到上一轮、界面只剩第一轮
+- e2e 暴露并修掉的 bug：列表里「本轮共 N 条」把 bookkeeping 也算进去（显示 4、实际删 3）；已改为只统计会被删除的条目并加回归测试
+
+### 10.5 已知行为
+
+- 每次重载会让 pi 追加一条 `thinking_level_change` entry（bookkeeping，不影响上下文），它不计入列表计数，也不会被删除
+- 若目标 entry 已带 `context_edit`，改文件只改原文；模型看到的仍是 replacement（UI 尚未标记号，见 §7.3）
+- `psm-log` 与 `<file>.psm-tmp` 都在 session 同目录；`.psm-log` / `.psm-tmp` 不以 `.jsonl` 结尾，不会被 `/resume` 扫到
+
+---
+
+## 11. 参考：被检查过的第三方包
 
 解析方法：`npm pack <pkg>` + `tar xzf` + grep。
 
