@@ -422,6 +422,18 @@ value:        entry.id
 | `assistant` | `Content[]`（可能含 thinking / text / toolCall） | **原样保留 `thinking` 与所有 `toolCall` block**，只替换 `text` block |
 | `toolResult` | `Content[]` | 通常整体替换为 `[{type:"text",text:新内容}]`；含图片块时图片保留 |
 
+**编辑界面 = `ctx.ui.editor(标题, 原文)`**，也就是 pi 自己的编辑器（`showExtensionEditor` → `ExtensionEditorComponent`，内部 `new Editor(tui, getEditorTheme())`，`interactive-mode.ts:2812`、`extension-editor.ts:79`）：
+
+| 能力 | 说明 |
+|---|---|
+| 完整编辑 | undo/redo、kill ring、按词移动、选择、多行粘贴折叠为 `[paste #1 +123 lines]` |
+| 内部滚动 | 只显示终端高度 30%（至少 5 行），光标跟随，边框显示 `↑ N` 隐藏行数（`editor.ts:538`） |
+| 提交 / 换行 / 取消 | Enter 提交、Shift+Enter 换行、Esc 或 Ctrl+C 取消（`extension-editor.ts:83-113`） |
+| **Ctrl+G 外部编辑器** | `tui.stop()` → `editInExternalEditor({command, content})` → 回填 → `tui.start()`（`:125-139`）；命令取 `settings.externalEditor` → `$VISUAL` → `$EDITOR` → `nano` |
+| 光标初始位置 | 文本末尾（`setTextInternal` 默认 `cursorPlacement: "end"`，`editor.ts:494-498`） |
+
+**不做查找/片段替换。** `Editor` 本身没有查找功能；长文本的定位与大改用 Ctrl+G 丢给外部编辑器（vim 有 `/` 与 `:s`）。
+
 **图片：原样保留**，编辑器标题写明「编辑消息（含 N 张图片，图片将保留）」。想删图做不到 —— 那是删除需求，不在编辑职责内。
 
 **`custom_message` 不纳入可编辑集合**。它是其他扩展注入进模型上下文的内容（如 magic-context 的 `<system-reminder>` 纸条），改了会让扩展自身状态与上下文不一致；真要清理噪音属于“删除”需求，由 `/psm-remove` 覆盖。
@@ -528,6 +540,7 @@ value:        entry.id
 - **删除或编辑区间内的 bookkeeping 条目**（`usage` / `model_change` / `label` / `custom` / `session_info`）
 - **跨分支操作**：`getBranch()` 只含活动分支，要动别的分支先 `/tree` 过去
 - **记住上次位置**：一次调用只完成一件事，结束后不保留状态
+- **查找 / 片段替换**：长文本定位与大改交给 `ctx.ui.editor` 的 Ctrl+G 外部编辑器
 - **多进程同文件**：pi 对 session 文件不加锁，不在支持范围
 - **`context_edit` 与文件改动混用**：若目标已有 `context_edit`，改文件只改了原文，模型看到的仍是 replacement（后者覆盖）；UI 上标一个记号提醒
 
@@ -540,6 +553,7 @@ value:        entry.id
 | 可编辑集合 | `user` / `assistant` / `toolResult`（已含 `custom_message` 以外的全部模型可见角色） |
 | 列表排序 | 正序（旧在上、最新在下），初始选中最后一条 |
 | 图片 | 原样保留，编辑器标题提示 |
+| 编辑界面 | `ctx.ui.editor`（pi 自己的 Editor）+ Ctrl+G 外部编辑器逃生口；不做查找/片段替换 |
 | 备份 | 旁挂单行日志 `<session>.psm-log`（不整文件快照） |
 | 插入新消息 | 不做 |
 | 记住上次位置 | 不做 |
