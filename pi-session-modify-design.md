@@ -305,7 +305,7 @@ export function writeAtomic(file: string, lines: string[]): void {
 
 |  | **A. 覆写原行** | **B. 追加 `context_edit`** | **C. `context` 钩子** |
 |---|---|---|---|
-| 如何生效 | 写文件 → 手工 `/resume` | 写 entry → 手工 `/resume`（或等下个刷新点自动生效） | 每次请求实时 |
+| 如何生效 | 写文件 → 自动重载（等价于 `/resume` 选自己） | 写 entry → 手工 `/resume`（或等下个刷新点） | 每次请求实时 |
 | `/resume` 后的聊天界面 | ✅ 显示新文本 | ❌ 永远显示原文 | ❌ 显示原文 |
 | 导出 / footer 统计 | ✅ 一致 | ✅ 一致（需先 `refreshContext`） | ❌ 不一致 |
 | 参与压缩 | ✅ | ✅ | ❌ |
@@ -317,15 +317,15 @@ export function writeAtomic(file: string, lines: string[]): void {
 
 **选定 A。** 理由：
 
-1. `/resume` 后聊天界面、导出、footer 统计全部是改后内容 —— 修改结果**一眼可验**
+1. 重载后聊天界面、导出、footer 统计全部是改后内容 —— 修改结果**一眼可验**
 2. 目标用 entryId 定位，不依赖内容匹配
-3. 不改动 pi 的运行时逻辑，纯文件操作 + 手工重载
+3. 不改动 pi 的运行时逻辑，纯文件操作 + 公开的 `switchSession` 重载
 4. `context_edit` 虽然对文件更“干净”，但它从不影响 UI 渲染源（`buildContextEntries()` 返回原始 entry，编辑只出现在 `buildSessionProjection().messages`），即使给 `custom` entry 加标记渲染器，被编辑那条也永远显示原文 —— 不能接受
 5. `context` 钩子不参与 canonical 投影，且拿不到 entryId
 
 **代价**（详见 §7.2）：覆盖原文字节（靠备份兜）、破坏 append-only、整文件重写的风险等级高于追加一行。
 
-> 注：**不要求“改完立即生效”**。命令不调 `switchSession`，改完提示用户手工 `/resume`。
+> 注：命令成功后**自动重载**（`ctx.switchSession(当前文件)`），用户无需手工操作；重载失败或被其他扩展 cancel 时降级提示手工 `/resume`。
 
 ---
 
@@ -340,14 +340,16 @@ export function writeAtomic(file: string, lines: string[]): void {
   ├─ 2. 过滤可编辑：type==="message" && role ∈ {user, assistant, toolResult}
   ├─ 3. 列表选择目标
   ├─ 4. 编辑器（预填原文）编辑
-  └─ 5. 以下是一个**零 await 的同步块**（防同进程后台写者插进来）
+  ├─ 5. 以下是一个**零 await 的同步块**（防同进程后台写者插进来）
         ├─ 备份 copyFileSync(file, `${file}.bak-<ISO>`)
         ├─ readFileSync → split 行 → 按 `"id":"<target>"` 定位唯一命中行
         ├─ 校验：header.version / 改后所有 parentId 可解析 / id 集合不变
         ├─ 只改该行 message.content，其余行原样输出 → 写 `${file}.ctxedit.tmp`
         ├─ renameSync(tmp, file)
         └─ 回读校验：重新 parse，entry 数与 id 集合与写前一致
-  └─ 6. 提示「已修改 <id>，执行 /resume 后生效」
+  └─ 6. await ctx.switchSession(getSessionFile(), { withSession })
+        ├─ 成功 → 在 withSession(newCtx) 里 notify「已修改 <id>」
+        └─ cancelled / 抛错 → 提示「文件已修改，请手工 /resume」
 ```
 
 前置检查：`ctx.hasUI` 为真、session 已落盘（`getSessionFile()` 有值）、非 streaming。
@@ -410,6 +412,7 @@ value:        entry.id
 5. **失败不写**：任何异常都中止，原文件不动
 6. **写后回读校验**：重新 parse 整份文件，entry 数与 id 集合与写前一致，且该行内容已是新内容
 7. **不处理多进程**：同一 session 文件被多个 pi 实例同时打开没被支持（pi 对 `auth.json` / `settings.json` / `trust` 用 `proper-lockfile`，**session 文件不加锁**），不在设计范围内
+8. **重载失败降级**：`switchSession` 返回 `cancelled`（其他扩展在 `session_before_switch` 里 cancel）或抛错时，不清回滚，只提示「文件已修改，请手工 `/resume`」
 
 ---
 
@@ -432,8 +435,9 @@ value:        entry.id
 | 破坏 append-only | 与设计约定不符 | 零 await 同步块 + 备份 + 文档写明 |
 | 覆盖原文 | 不可撤销 | 备份文件；还原需从备份里取回那一行（不能整文件覆盖回滚，否则会丢编辑后新增的条目） |
 | 改坏 JSON | 中间行坏 → `parentId` 悬空 → 回溯静默终止，后续历史消失 | §6.4 的写前全量 `parentId` 校验 + 写后回读校验 + 备份 |
-| 编辑后未 `/resume` 就继续提问 | 模型与界面都还是旧内容（自洽，但不等于“真心改完就生效”） | 提示文案写明需手工 `/resume` |
-| 编辑后未 `/resume` 就 `/fork` | 新文件从**内存**写出，带的是旧文本 | 同上，先 `/resume` 再 fork |
+| 编辑后未重载就继续提问 | 自动重载成功时不会发生；重载被 cancel / 抛错时模型与界面仍为旧内容 | §6.4.8 的降级提示 |
+| 编辑后未重载就 `/fork` | 同上（新文件从**内存**写出，带旧文本） | 同上 |
+| 每次编辑都触发 `session_shutdown` + `session_start` | 其他扩展（如 magic-context）重建自己的状态；大 session 有短暂重建耗时 | 与真 `/resume` 完全同路径，不再额外处理 |
 | 改 assistant 的 content 丢 toolCall | provider 报 tool_result 无对应 tool_use | §6.3 强制保留非 text block |
 | 压缩后 entry 位置变化 | 目标行还在，不影响按 id 定位 | — |
 
