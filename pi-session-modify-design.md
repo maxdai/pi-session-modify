@@ -83,9 +83,9 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 | `_rewriteFile()` → `openSync(file,"w")` + 按**内存** entries 重写 | 整文件覆盖 | 会被覆盖 |
 | `_persist()` 首次落盘 → `openSync(file,"wx")` | 新建 | — |
 
-`_rewriteFile()` 触发点：`_loadEntries` 版本迁移、`createBranchedSession`（`/fork`）、压缩后。
+`_rewriteFile()` 触发点（全仓三处）：空文件初始化（`:1043`）、版本迁移（`:1093`）、`createBranchedSession`（`/fork`，`:1720`）。**压缩不重写文件**，只追加。
 
-**结论：手工改文件必须在 pi 没打开该 session 时做。**
+**结论：pi 持有 session 时改文件是可行的。** pi 自己每次写入都按路径打开（`appendFileSync` / `openSync(path,"w")`），`rename` 换掉 inode 后会自然写到新文件。代价是 pi 内存里仍是旧内容 —— 需要 `/resume` 重新读盘才生效（`/reload` 不重读 session 文件，见 §3.4）。
 
 ---
 
@@ -145,7 +145,7 @@ function projectContextEntry(entry, edit) {
 
 `appendContextEdit` 只做 `_appendEntry`（追加 + 落盘），**不刷新 `agent.state.messages`**。
 
-刷新由私有方法 `_refreshFinalizedContext()` 负责，它的 10 个调用点全在 pi 内部：
+刷新由私有方法 `_refreshFinalizedContext()` 负责，它的 9 个调用点全在 pi 内部（另 1 处为定义）：
 
 ```
 938  定义
@@ -303,26 +303,29 @@ export function writeAtomic(file: string, lines: string[]): void {
 
 ## 5. 三个候选方案
 
-|  | **A. 改文件 + `switchSession` 重载** | **B. `context_edit`** | **C. `context` 钩子** |
+|  | **A. 覆写原行** | **B. 追加 `context_edit`** | **C. `context` 钩子** |
 |---|---|---|---|
-| 立即生效 | ✅ | ❌ 无公开刷新入口 | ✅ |
-| UI / 导出 / footer 统计 | ✅ 一致 | ❌ 显示原文 | ❌ 显示原文 |
+| 如何生效 | 写文件 → 手工 `/resume` | 写 entry → 手工 `/resume`（或等下个刷新点自动生效） | 每次请求实时 |
+| `/resume` 后的聊天界面 | ✅ 显示新文本 | ❌ 永远显示原文 | ❌ 显示原文 |
+| 导出 / footer 统计 | ✅ 一致 | ✅ 一致（需先 `refreshContext`） | ❌ 不一致 |
 | 参与压缩 | ✅ | ✅ | ❌ |
-| reload / 重启后存活 | ✅ | ✅ | 需另存 custom entry |
-| 公开 API | ✅ | ❌ 要摸私有 `appendContextEdit` | ✅ |
+| 原文 | ❌ 被覆盖（靠备份） | ✅ 保留 | ✅ 保留 |
 | 破坏 append-only | ⚠️ 是 | ❌ 否 | ❌ 否 |
-| 原文保留 | ❌ 被覆盖 | ✅ | ✅ |
+| 写坏的后果 | ⚠️ 中间行坏 → 历史静默截断 | 丢一行 → 等于没改 | 无写入 |
 | 目标识别 | entryId（可靠） | entryId（可靠） | 只能靠内容/位置（脆弱） |
+| 能否验证改成功了 | ✅ 一眼看出 | ❌ 无法验证 | ❌ 无法验证 |
 
 **选定 A。** 理由：
 
-1. 与心智模型一致：改文件 → 重新加载
-2. `switchSession(自己)` 是公开 API，效果等于 `/resume` 选当前
-3. 改完模型 / UI / 导出 / 统计全部一致，不产生"模型看到的和我看到的不一样"的分裂
-4. 目标用 entryId 定位，不依赖内容匹配
-5. 不碰任何私有方法
+1. `/resume` 后聊天界面、导出、footer 统计全部是改后内容 —— 修改结果**一眼可验**
+2. 目标用 entryId 定位，不依赖内容匹配
+3. 不改动 pi 的运行时逻辑，纯文件操作 + 手工重载
+4. `context_edit` 虽然对文件更“干净”，但它从不影响 UI 渲染源（`buildContextEntries()` 返回原始 entry，编辑只出现在 `buildSessionProjection().messages`），即使给 `custom` entry 加标记渲染器，被编辑那条也永远显示原文 —— 不能接受
+5. `context` 钩子不参与 canonical 投影，且拿不到 entryId
 
-**代价**：覆盖原文字节。用自动备份 + 立即重载来兜（重载后内存与文件一致，后续压缩重写不会丢）。
+**代价**（详见 §7.2）：覆盖原文字节（靠备份兜）、破坏 append-only、整文件重写的风险等级高于追加一行。
+
+> 注：**不要求“改完立即生效”**。命令不调 `switchSession`，改完提示用户手工 `/resume`。
 
 ---
 
@@ -332,19 +335,22 @@ export function writeAtomic(file: string, lines: string[]): void {
 
 ```
 /ctxedit
+  ├─ await ctx.waitForIdle()                    ← 非 streaming 才动手
   ├─ 1. 读 ctx.sessionManager.getBranch()
-  ├─ 2. 过滤可编辑 entry:
-  │       type==="message" && role ∈ {user, assistant, toolResult}
-  │       或 type==="custom_message"
-  ├─ 3. ctx.ui.custom(SelectList) 选目标
-  ├─ 4. ctx.ui.editor(标题, 原文文本) 编辑
-  ├─ 5. 校验新内容
-  ├─ 6. 备份 session 文件
-  ├─ 7. 改写 JSONL 中那一行（tmp + rename，只动 message.content）
-  └─ 8. await ctx.switchSession(当前 sessionFile)   ← 重载，立即生效
+  ├─ 2. 过滤可编辑：type==="message" && role ∈ {user, assistant, toolResult}
+  ├─ 3. 列表选择目标
+  ├─ 4. 编辑器（预填原文）编辑
+  └─ 5. 以下是一个**零 await 的同步块**（防同进程后台写者插进来）
+        ├─ 备份 copyFileSync(file, `${file}.bak-<ISO>`)
+        ├─ readFileSync → split 行 → 按 `"id":"<target>"` 定位唯一命中行
+        ├─ 校验：header.version / 改后所有 parentId 可解析 / id 集合不变
+        ├─ 只改该行 message.content，其余行原样输出 → 写 `${file}.ctxedit.tmp`
+        ├─ renameSync(tmp, file)
+        └─ 回读校验：重新 parse，entry 数与 id 集合与写前一致
+  └─ 6. 提示「已修改 <id>，执行 /resume 后生效」
 ```
 
-前置检查：`ctx.hasUI` 为真、非 streaming（`ctx.waitForIdle()`）、session 已落盘（`getSessionFile()` 有值）。
+前置检查：`ctx.hasUI` 为真、session 已落盘（`getSessionFile()` 有值）、非 streaming。
 
 ### 6.2 列表 UI
 
@@ -360,7 +366,7 @@ description:  `${toolName?}  ${字数} 字  ${相对时间}  ${已编辑标记}`
 value:        entry.id
 ```
 
-- `roleLabel`: `你` / `助手` / `工具结果` / `自定义`
+- `roleLabel`: `你` / `助手` / `工具结果`
 - 只列**当前分支**上的（`getBranch()` 已经保证）
 - 逆序（最新在上）还是正序（最旧在上）待定，见 §8
 - 已存在 `context_edit` 指向它的，标一个记号（避免困惑）
@@ -376,7 +382,8 @@ value:        entry.id
 | `user` | `Content[]` | 保留非 text block（图片等，或按策略丢弃并提示），text 部分替换为一条新 text |
 | `assistant` | `Content[]`（可能含 thinking / text / toolCall） | **原样保留 `thinking` 与所有 `toolCall` block**，只替换 `text` block |
 | `toolResult` | `Content[]` | 通常整体替换为 `[{type:"text",text:新内容}]`；若含图片块，提示后按策略处理 |
-| `custom_message` | `string \| Content[]` | 按原类型给回 |
+
+**`custom_message` 不纳入可编辑集合**（第一版）。它是其他扩展注入进模型上下文的内容（如 magic-context 的 `<system-reminder>` 纸条），改了会让扩展自身状态与上下文不一致；真要清理噪音属于“过滤/删除”需求，不是本工具职责。
 
 **空内容怎么处理：**
 
@@ -396,12 +403,13 @@ value:        entry.id
 
 ### 6.4 安全措施
 
-1. **备份**：动手前 `copyFileSync(file, `${file}.bak-${Date.now()}`)`，失败则不写
-2. **前置校验**：header 存在且 `version === CURRENT_SESSION_VERSION`
-3. **行级校验**：命中行的 `id` 必须唯一；改完 `parentId` 集合必须仍全部可解析
+1. **零 await 同步块**：`读 → 校验 → 写 tmp → rename → 回读` 全程不 await。扩展与 pi 同进程，事件循环单线程，同步块内其他回调（cache-warmer 的 `appendUsage`、其他扩展的 `appendEntry`）插不进来。弹窗全部结束后才开始此块。
+2. **备份**：动手前 `copyFileSync(file, `${file}.bak-<ISO>`)`，失败则不写
+3. **写前校验**：header 存在且 `version === CURRENT_SESSION_VERSION`；命中行的 `id` 在整文件中唯一；改后所有 `parentId` 仍全部可解析、`id` 集合不变
 4. **原子写**：tmp + `renameSync`，不原地截断
 5. **失败不写**：任何异常都中止，原文件不动
-6. **不并发**：pi 自己持有该文件（写入期间会 `appendFileSync`），所以要求 idle，且改完立刻 `switchSession` 让 runtime 重建
+6. **写后回读校验**：重新 parse 整份文件，entry 数与 id 集合与写前一致，且该行内容已是新内容
+7. **不处理多进程**：同一 session 文件被多个 pi 实例同时打开没被支持（pi 对 `auth.json` / `settings.json` / `trust` 用 `proper-lockfile`，**session 文件不加锁**），不在设计范围内
 
 ---
 
@@ -421,10 +429,11 @@ value:        entry.id
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 破坏 append-only | 与设计约定不符；其他实例可能已读旧内容 | 要求 idle + 改完立即重载 + 备份 |
-| 覆盖原文 | 不可撤销 | 备份文件；文档写明 |
-| 另一个 pi 正在写同一文件 | 行错位 / 覆盖 | 不在多实例场景使用；`switchSession` 前 `waitForIdle` |
-| 改坏 JSON | 该行静默消失 | 写后回读校验 + 备份 |
+| 破坏 append-only | 与设计约定不符 | 零 await 同步块 + 备份 + 文档写明 |
+| 覆盖原文 | 不可撤销 | 备份文件；还原需从备份里取回那一行（不能整文件覆盖回滚，否则会丢编辑后新增的条目） |
+| 改坏 JSON | 中间行坏 → `parentId` 悬空 → 回溯静默终止，后续历史消失 | §6.4 的写前全量 `parentId` 校验 + 写后回读校验 + 备份 |
+| 编辑后未 `/resume` 就继续提问 | 模型与界面都还是旧内容（自洽，但不等于“真心改完就生效”） | 提示文案写明需手工 `/resume` |
+| 编辑后未 `/resume` 就 `/fork` | 新文件从**内存**写出，带的是旧文本 | 同上，先 `/resume` 再 fork |
 | 改 assistant 的 content 丢 toolCall | provider 报 tool_result 无对应 tool_use | §6.3 强制保留非 text block |
 | 压缩后 entry 位置变化 | 目标行还在，不影响按 id 定位 | — |
 
