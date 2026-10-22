@@ -5,6 +5,7 @@
  * session file and log it → reload the same file so the transcript redraws from
  * disk and the next request sees the new content.
  */
+import { appendFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { editableItems, turnItems } from "./items.ts";
 import { preview, textOf } from "./messages.ts";
@@ -50,9 +51,13 @@ async function prepare(ctx: ExtensionCommandContext): Promise<Prepared | undefin
 }
 
 /**
- * Reload the session we just rewrote. On success the notice goes through the new
- * context (the old one is stale afterwards); on failure the file is already
+ * Reload the session we just rewrote. On success pi draws the whole transcript
+ * from disk and prints "Resumed session" itself; on failure the file is already
  * changed, so the only honest thing left is to say so.
+ *
+ * The outcome is appended to the psm log: when the reload dies after teardown the
+ * old ctx is stale and a notify through it throws, which would otherwise leave
+ * the failure invisible.
  */
 async function reload(ctx: ExtensionCommandContext, file: string, successText: string): Promise<void> {
 	let warning: string | undefined;
@@ -64,17 +69,28 @@ async function reload(ctx: ExtensionCommandContext, file: string, successText: s
 		});
 		if (result.cancelled) {
 			warning = "文件已修改，但重载被取消；请手工执行 /resume";
+			logReload(file, "cancelled");
+		} else {
+			logReload(file, "ok");
 		}
 	} catch (error) {
 		warning = `文件已修改，但重载失败（${errorMessage(error)}）；请手工执行 /resume`;
+		logReload(file, `error: ${errorMessage(error)}`);
 	}
 
 	if (!warning) return;
 	try {
 		ctx.ui.notify(warning, "warning");
 	} catch {
-		// Old context is stale after a partially completed replacement; pi already
-		// shows the fatal error in that case.
+		// Old context already stale; the psm log above holds the outcome.
+	}
+}
+
+function logReload(file: string, outcome: string): void {
+	try {
+		appendFileSync(`${file}.psm-log`, `${JSON.stringify({ op: "reload", ts: new Date().toISOString(), outcome })}\n`);
+	} catch {
+		// Logging is best-effort; never turn it into a second failure.
 	}
 }
 
