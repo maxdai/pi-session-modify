@@ -1,12 +1,14 @@
 /**
  * Command wiring for /psm-edit and /psm-remove.
  *
- * Both commands run the same pre-flight (interactive UI, idle agent, session file
- * on disk), let the user pick a target, and then hand off to the rewrite step.
- * The rewrite itself lands in src/session-file.ts in the next step.
+ * Flow: pre-flight → pick a target → collect the new text / confirm → rewrite the
+ * session file and log it → reload the same file so the transcript redraws from
+ * disk and the next request sees the new content.
  */
 import type { ExtensionAPI, ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { editableItems, turnItems } from "./items.ts";
+import { preview, textOf } from "./messages.ts";
+import { applyEdit, applyRemove } from "./session-file.ts";
 import { pickItem } from "./ui.ts";
 
 interface Prepared {
@@ -14,10 +16,23 @@ interface Prepared {
 	branch: SessionEntry[];
 }
 
-/**
- * Shared pre-flight: interactive UI, idle agent, session already persisted.
- * Returns undefined (after notifying) when the command must not proceed.
- */
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function countImages(entry: SessionEntry): number {
+	if (entry.type !== "message") return 0;
+	const message = entry.message;
+	if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return 0;
+	const content: unknown = message.content;
+	if (!Array.isArray(content)) return 0;
+	return content.filter(
+		(block: unknown) =>
+			typeof block === "object" && block !== null && (block as { type?: unknown }).type === "image",
+	).length;
+}
+
+/** Shared pre-flight: interactive UI, idle agent, session already persisted. */
 async function prepare(ctx: ExtensionCommandContext): Promise<Prepared | undefined> {
 	if (!ctx.hasUI) {
 		return undefined;
@@ -34,6 +49,35 @@ async function prepare(ctx: ExtensionCommandContext): Promise<Prepared | undefin
 	return { file, branch: ctx.sessionManager.getBranch() };
 }
 
+/**
+ * Reload the session we just rewrote. On success the notice goes through the new
+ * context (the old one is stale afterwards); on failure the file is already
+ * changed, so the only honest thing left is to say so.
+ */
+async function reload(ctx: ExtensionCommandContext, file: string, successText: string): Promise<void> {
+	let warning: string | undefined;
+	try {
+		const result = await ctx.switchSession(file, {
+			withSession: async (newCtx) => {
+				newCtx.ui.notify(successText, "info");
+			},
+		});
+		if (result.cancelled) {
+			warning = "文件已修改，但重载被取消；请手工执行 /resume";
+		}
+	} catch (error) {
+		warning = `文件已修改，但重载失败（${errorMessage(error)}）；请手工执行 /resume`;
+	}
+
+	if (!warning) return;
+	try {
+		ctx.ui.notify(warning, "warning");
+	} catch {
+		// Old context is stale after a partially completed replacement; pi already
+		// shows the fatal error in that case.
+	}
+}
+
 async function handleEdit(_args: string, ctx: ExtensionCommandContext): Promise<void> {
 	const prepared = await prepare(ctx);
 	if (!prepared) return;
@@ -47,7 +91,28 @@ async function handleEdit(_args: string, ctx: ExtensionCommandContext): Promise<
 	const targetId = await pickItem(ctx, "选择要编辑的消息", items, items.length - 1);
 	if (!targetId) return;
 
-	ctx.ui.notify(`psm-edit：选中 ${targetId}（改写逻辑待接入）`, "info");
+	const entry = prepared.branch.find((candidate) => candidate.id === targetId);
+	if (!entry) return;
+
+	const original = textOf(entry) ?? "";
+	const images = countImages(entry);
+	const title = images > 0 ? `编辑消息（含 ${images} 张图片，图片将保留）` : "编辑消息";
+
+	const edited = await ctx.ui.editor(title, original);
+	if (edited === undefined) return;
+	if (edited === original) {
+		ctx.ui.notify("内容没有变化，未写入", "info");
+		return;
+	}
+
+	try {
+		applyEdit({ path: prepared.file, entryId: targetId, newText: edited });
+	} catch (error) {
+		ctx.ui.notify(`psm-edit 失败：${errorMessage(error)}`, "error");
+		return;
+	}
+
+	await reload(ctx, prepared.file, `已修改消息：${preview(edited, 40)}`);
 }
 
 async function handleRemove(_args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -63,7 +128,16 @@ async function handleRemove(_args: string, ctx: ExtensionCommandContext): Promis
 	const targetId = await pickItem(ctx, "选择要删除的一轮", items, items.length - 1);
 	if (!targetId) return;
 
-	ctx.ui.notify(`psm-remove：选中 ${targetId}（删除逻辑待接入）`, "info");
+	const label = items.find((item) => item.id === targetId)?.label ?? targetId;
+	const confirmed = await ctx.ui.confirm("删除这一轮", `${label}\n\n删除后无法从会话文件恢复，只能从 .psm-log 取回原文。`);
+	if (!confirmed) return;
+
+	try {
+		const outcome = applyRemove({ path: prepared.file, userId: targetId, branchIds: prepared.branch.map((entry) => entry.id) });
+		await reload(ctx, prepared.file, `已删除这一轮（${outcome.removed} 条消息）`);
+	} catch (error) {
+		ctx.ui.notify(`psm-remove 失败：${errorMessage(error)}`, "error");
+	}
 }
 
 export function registerCommands(pi: ExtensionAPI): void {

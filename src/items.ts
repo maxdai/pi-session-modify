@@ -54,7 +54,11 @@ export function turnItems(branch: SessionEntry[]): PickerItem[] {
 			currentCount = 1;
 			continue;
 		}
-		currentCount += 1;
+		// Count only what /psm-remove would actually drop: bookkeeping entries
+		// (usage, model_change, thinking_level_change, labels…) stay behind.
+		if (entry.type === "message" || entry.type === "custom_message") {
+			currentCount += 1;
+		}
 	}
 	flush();
 
