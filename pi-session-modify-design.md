@@ -8,9 +8,14 @@
 
 ## 1. 目标
 
-一个 pi 扩展，让你**挑一条历史消息，改掉它的内容，后面的历史保持不动并继续**。
+一个 pi 扩展，两个命令：
 
-明确不做：从某条消息重新开始（那是 `/tree` + 重新提问的事）、删除消息、文件回滚。
+- `/psm-edit` —— 挑一条历史消息，改掉它的内容，后面的历史保持不动并继续
+- `/psm-remove` —— 丢掉一整轮（一条 `user` 及它引发的 assistant / toolCall / toolResult）
+
+改完自动重载，界面与模型看到的都是新内容。
+
+不算目标：从某条消息重新开始（那是 `/tree` + 重新提问）、在历史中间插入新消息。
 
 ---
 
@@ -327,135 +332,220 @@ export function writeAtomic(file: string, lines: string[]): void {
 
 > 注：命令成功后**自动重载**（`ctx.switchSession(当前文件)`），用户无需手工操作；重载失败或被其他扩展 cancel 时降级提示手工 `/resume`。
 
+### 5.1 删除的两种语义
+
+|  | **投影删除**（`context_edit` + `replacement: null`） | **真删除**（删行 + 重连 `parentId`） |
+|---|---|---|
+| 模型上下文 | ✅ 这条消失 | ✅ 消失 |
+| 聊天界面 | ❌ 仍显示 | ✅ 消失 |
+| 文件结构 | 不动 | 改写若干行的 `parentId` |
+| 撤回 | `/tree` 跳回 | 从 `psm-log` 还原 |
+
+`replacement: null` 在 `projectContextEntry` 里就是 `return []`（`session-manager.ts:523`）—— 这是 pi 官方的“从上下文删除”语义，但界面上看不出来。
+
+**选定真删除**：与编辑保持同一心智 —— 改的是文件，重载后所见即所得。
+
 ---
 
-## 6. 方案 A 设计
+## 6. 设计
 
-### 6.1 流程
+### 6.1 两个命令
+
+| 命令 | 作用 | 列表内容 |
+|---|---|---|
+| `/psm-edit` | 改写一条历史的文本内容 | `user` / `assistant` / `toolResult`（当前分支） |
+| `/psm-remove` | 删除一整轮（一条 `user` 及其引发的后续） | 仅 `user` |
+
+一次调用只做一件事：改一条，或删一轮。命令结束后操作即完成，不保留“上次位置”。
+
+### 6.2 公共流程
 
 ```
-/ctxedit
+/psm-edit | /psm-remove
+  ├─ 前置：ctx.hasUI、session 已落盘（getSessionFile() 有值）
   ├─ await ctx.waitForIdle()                    ← 非 streaming 才动手
   ├─ 1. 读 ctx.sessionManager.getBranch()
-  ├─ 2. 过滤可编辑：type==="message" && role ∈ {user, assistant, toolResult}
-  ├─ 3. 列表选择目标
-  ├─ 4. 编辑器（预填原文）编辑
-  ├─ 5. 以下是一个**零 await 的同步块**（防同进程后台写者插进来）
-        ├─ 备份 copyFileSync(file, `${file}.bak-<ISO>`)
-        ├─ readFileSync → split 行 → 按 `"id":"<target>"` 定位唯一命中行
-        ├─ 校验：header.version / 改后所有 parentId 可解析 / id 集合不变
-        ├─ 只改该行 message.content，其余行原样输出 → 写 `${file}.ctxedit.tmp`
-        ├─ renameSync(tmp, file)
-        └─ 回读校验：重新 parse，entry 数与 id 集合与写前一致
-  └─ 6. await ctx.switchSession(getSessionFile(), { withSession })
-        ├─ 成功 → 在 withSession(newCtx) 里 notify「已修改 <id>」
+  ├─ 2. 过滤 → 列表选择（正序：旧在上、最新在下，初始选中最后一条）
+  ├─ 3. /psm-edit → ctx.ui.editor(标题, 原文) 取新文本
+  │   /psm-remove → ctx.ui.confirm(标题, 将删除 N 条) 确认
+  ├─ 4. 以下是一个**零 await 的同步块**（防同进程后台写者插进来）
+  │     ├─ readFileSync 全文
+  │     ├─ 在内存里算出改动后的行集合（编辑：改一行 / 删除：删多行 + 重连 parentId）
+  │     ├─ 写前校验（§6.6）
+  │     ├─ 追加 psm-log（§6.7）—— 先写日志，再动 session
+  │     ├─ 只改必要的行，其余行原样输出 → 写 `<file>.psm-tmp`
+  │     ├─ renameSync(tmp, file)
+  │     └─ 回读校验：entry 数 / id 集合 / parentId 全部可解析
+  └─ 5. await ctx.switchSession(getSessionFile(), { withSession })
+        ├─ 成功 → withSession(newCtx).ui.notify(操作结果)
         └─ cancelled / 抛错 → 提示「文件已修改，请手工 /resume」
 ```
 
 前置检查：`ctx.hasUI` 为真、session 已落盘（`getSessionFile()` 有值）、非 streaming。
 
-### 6.2 列表 UI
+### 6.3 列表
 
 ```ts
 interface SelectItem { value: string; label: string; description?: string }
 ```
 
-建议：
+**排序：正序（旧在上、最新在下），初始选中最后一条**（`setSelectedIndex`，`select-list.ts:67`）。方向与聊天界面一致，说“上面那条”不会指错。
+
+编辑列表：
 
 ```
 label:        `${roleLabel}  ${首行预览,截断到 ~60 字}`
+            roleLabel = 你 / 助手 / 工具结果
 description:  `${toolName?}  ${字数} 字  ${相对时间}  ${已编辑标记}`
 value:        entry.id
 ```
 
-- `roleLabel`: `你` / `助手` / `工具结果`
+删除列表（只列 `user`）：
+
+```
+label:        `你  ${提问首行预览}`
+description:  `本轮共 N 条（${角色分布}）  ${相对时间}`
+value:        entry.id
+```
+
 - 只列**当前分支**上的（`getBranch()` 已经保证）
-- 逆序（最新在上）还是正序（最旧在上）待定，见 §8
 - 已存在 `context_edit` 指向它的，标一个记号（避免困惑）
+- `ctx.ui.select(title, string[])` 只能给纯字符串、无搜索；要 label + description 双列 + 子串搜索，必须走 `ctx.ui.custom` + `Input` + `SelectList`（参照 `model-selector.ts` 的搜索框写法）
 
-`ctx.ui.select(title, string[])` 只接受纯字符串，够用但排版受限。若要 label + description 双列，必须走 `ctx.ui.custom` + `SelectList`。
-
-### 6.3 改写细节（按 role 分支）
+### 6.4 编辑：改写细节（按 role 分支）
 
 **只替换 text，保留其余 block。** 这是最关键的一条 —— assistant 的 `toolCall` block 一旦丢失，后续 `toolResult` 变孤儿，provider 直接报错。
 
 | role | 原 content | 新 content |
 |---|---|---|
-| `user` | `Content[]` | 保留非 text block（图片等，或按策略丢弃并提示），text 部分替换为一条新 text |
+| `user` | `Content[]` | 保留非 text block（图片原样保留），text 部分替换为一条新 text |
 | `assistant` | `Content[]`（可能含 thinking / text / toolCall） | **原样保留 `thinking` 与所有 `toolCall` block**，只替换 `text` block |
-| `toolResult` | `Content[]` | 通常整体替换为 `[{type:"text",text:新内容}]`；若含图片块，提示后按策略处理 |
+| `toolResult` | `Content[]` | 通常整体替换为 `[{type:"text",text:新内容}]`；含图片块时图片保留 |
 
-**`custom_message` 不纳入可编辑集合**（第一版）。它是其他扩展注入进模型上下文的内容（如 magic-context 的 `<system-reminder>` 纸条），改了会让扩展自身状态与上下文不一致；真要清理噪音属于“过滤/删除”需求，不是本工具职责。
+**图片：原样保留**，编辑器标题写明「编辑消息（含 N 张图片，图片将保留）」。想删图做不到 —— 那是删除需求，不在编辑职责内。
 
-**空内容怎么处理：**
+**`custom_message` 不纳入可编辑集合**。它是其他扩展注入进模型上下文的内容（如 magic-context 的 `<system-reminder>` 纸条），改了会让扩展自身状态与上下文不一致；真要清理噪音属于“删除”需求，由 `/psm-remove` 覆盖。
 
-- **不实现"删掉这一行"**。删除会让子节点 `parentId` 悬空 → 路径静默截断。见 §7。
-- 允许"把内容改成空文本"（`[{type:"text",text:""}]`），这是合法但无明显效果的编辑。
+**空内容**：允许改成空文本（`[{type:"text",text:""}]`），合法但无明显效果；与原文本逐字相同时提示“未修改”且不写文件、不重载。
 
 **改写实现：**
 
 ```
-读整个文件 → split("\n") → 逐行 JSON.parse
+读整个文件 → split("\n") → 仅 JSON.parse 需要定位/校验的行
   → 命中 entry.id 的那一行：替换 entry.message.content
-  → 其余行原样保留字符串（不做 JSON 往返，避免转义/字段顺序变化）
-→ 写 `<file>.ctxedit.tmp` → renameSync 覆盖
+  → 其余行原样保留原始字符串
+→ 写 `<file>.psm-tmp` → renameSync 覆盖
 ```
 
 **其余行保持原始字符串，不做 parse→stringify 往返**，避免浮点/转义/字段顺序被改写。这是与 `@sevten/pi-edit-reply` 的差别（它整文件重排）。
 
-### 6.4 安全措施
+### 6.5 删除：一轮
 
-1. **零 await 同步块**：`读 → 校验 → 写 tmp → rename → 回读` 全程不 await。扩展与 pi 同进程，事件循环单线程，同步块内其他回调（cache-warmer 的 `appendUsage`、其他扩展的 `appendEntry`）插不进来。弹窗全部结束后才开始此块。
-2. **备份**：动手前 `copyFileSync(file, `${file}.bak-<ISO>`)`，失败则不写
-3. **写前校验**：header 存在且 `version === CURRENT_SESSION_VERSION`；命中行的 `id` 在整文件中唯一；改后所有 `parentId` 仍全部可解析、`id` 集合不变
-4. **原子写**：tmp + `renameSync`，不原地截断
-5. **失败不写**：任何异常都中止，原文件不动
-6. **写后回读校验**：重新 parse 整份文件，entry 数与 id 集合与写前一致，且该行内容已是新内容
-7. **不处理多进程**：同一 session 文件被多个 pi 实例同时打开没被支持（pi 对 `auth.json` / `settings.json` / `trust` 用 `proper-lockfile`，**session 文件不加锁**），不在设计范围内
-8. **重载失败降级**：`switchSession` 返回 `cancelled`（其他扩展在 `session_before_switch` 里 cancel）或抛错时，不清回滚，只提示「文件已修改，请手工 `/resume`」
+**区间定义**：从选中的 `user` 条目（含）到下一条 `user` 条目（不含）。
+
+**删什么**：区间内的 `message` 与 `custom_message`；**`usage` / `model_change` / `label` / `context_edit` / `custom` / `session_info` 等 bookkeeping 条目全部保留**（它们不是“这一轮说了什么”；删 `model_change` 会改变该处的模型归属，`label` 是你自己打的标记）。
+
+**重连算法**：
+
+```
+1. 标记区间内要删的条目
+2. 顺序遍历当前分支：若某条 parentId 指向被删条目
+   → 改指向“它之前最近的保留条目”（没有则 null）
+3. 重写涉及的行（被删行丢弃，被重连行只改 parentId 字段）
+```
+
+区间内若存在分支点（一个条目有多个子节点），删除后这些子节点会一起上挂到同一个保留父节点 —— 结构合法（只是分支点上移一层），不报错。
+
+**三条安全前提：**
+
+1. **toolCall / toolResult 配对** —— 按轮删天然满足。但已知单向不对称：删 `toolResult` 留 `toolCall` 是安全的（pi 会补合成结果 `"No result provided"`，`transform-messages.ts:179-206`）；删 `toolCall` 留 `toolResult` 会直接透传给 API（`:110-118` 无过滤）→ Anthropic 拒。所以**永不支持单条删 toolResult / assistant**。
+2. **compaction 的 `firstKeptEntryId` 不得被删** —— 否则 `buildContextEntries` 里 `foundFirstKept` 永远为 false（`session-manager.ts:501-509`），那段时间的条目静默不进上下文。检测到就**拒绝删除**并提示。
+3. **允许删最后一轮** —— 逻辑上没有额外风险（重载后 leaf 自动落到文件最后一行）。
+
+其余悬空引用（`context_edit.targetId`、`label.targetId`、`branch_summary.fromId` 指向被删条目）**都无害**：只是查不到目标，不影响加载与投影，不额外处理。
+
+### 6.6 写文件与校验
+
+1. **零 await 同步块**：`读 → 算 → 校验 → 写 tmp → rename → 回读` 全程不 await。扩展与 pi 同进程，事件循环单线程，同步块内其他回调（cache-warmer 的 `appendUsage`、其他扩展的 `appendEntry`）插不进来。弹窗全部结束后才开始此块。
+2. **写前校验**：header 存在且 `version === CURRENT_SESSION_VERSION`；目标 `id` 在整文件中唯一；改后所有 `parentId` 仍全部可解析；`id` 集合只减不增（编辑不变、删除只减）
+3. **原子写**：tmp + `renameSync`，不原地截断
+4. **失败不写**：任何异常都中止，原文件不动
+5. **写后回读校验**：重新 parse 整份文件，entry 数与 id 集合符合预期，编辑行内容为新内容
+6. **不处理多进程**：同一 session 文件被多个 pi 实例同时打开没被支持（pi 对 `auth.json` / `settings.json` / `trust` 用 `proper-lockfile`，**session 文件不加锁**），不在设计范围内
+
+### 6.7 日志与自动重载
+
+**日志：`<sessionFile>.psm-log`**（同一目录，不以 `.jsonl` 结尾，所以不会被 `/resume` 扫到）。追加式，每行一条：
+
+```json
+{"ts":"…","op":"edit","entryId":"…","originalLine":"…"}
+{"ts":"…","op":"delete","removedLines":["…","…"]}
+{"ts":"…","op":"reparent","entryId":"…","oldParentId":"…","newParentId":"…"}
+```
+
+一次删除会写 1 条 `delete` + N 条 `reparent`，这样能精确还原（含父指针）。**先写日志再 rename session 文件**：日志多一条比少一条安全。
+
+为什么不做整文件快照：你的会话最大已到 39.7 MB，每次编辑整文件备份就是 40MB；而整文件回滚本身也不优雅 —— 编辑之后新增的条目会被一起覆盖回去。
+
+**自动重载**：`await ctx.switchSession(getSessionFile(), { withSession })`
+- 成功：重建 runtime → 清屏重画整份 transcript → 新内容当场可见
+- cancelled（其他扩展在 `session_before_switch` 里 cancel）或抛错：**不回滚**，提示「文件已修改，请手工 `/resume`」
+- 代价：每次操作都触发所有扩展的 `session_shutdown` + `session_start`（与真 `/resume` 完全同路径）
 
 ---
 
 ## 7. 风险与边界
 
-### 7.1 为什么不支持删除
+### 7.1 删除为什么比编辑重
 
-删掉一行 → 它的子节点 `parentId` 悬空 → `buildSessionPath` 回溯静默终止 → **历史凭空截断且不报错**。
+编辑只改一条的 content；删除要改多条 `parentId`，还可能导致：
 
-真要删必须重连子节点 `parentId`（把子节点接到被删节点的父节点）。单链情况下可行，但：
-- 可能有多个子节点（分支），接哪个需要策略
-- 若被删节点是 `compaction` 的 `firstKeptEntryId` 或某个 `context_edit` 的 `targetId`，引用会断
+- 子节点 `parentId` 指向已删除行 → `buildSessionPath` 回溯**静默终止**，后续历史凭空消失且不报错
+- `compaction.firstKeptEntryId` 被删 → 那段历史静默不进上下文
+- toolCall / toolResult 配对断裂 → provider 报错
 
-**第一版不做。** 删除另有办法：`/tree` 跳过去 + 重新提问，或 `/compact`。
+所以删除必须：修父指针、检查 compaction 引用、只按轮删。三者缺一不可，其余悬空引用无害（§6.5）。
 
 ### 7.2 已知风险表
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 破坏 append-only | 与设计约定不符 | 零 await 同步块 + 备份 + 文档写明 |
-| 覆盖原文 | 不可撤销 | 备份文件；还原需从备份里取回那一行（不能整文件覆盖回滚，否则会丢编辑后新增的条目） |
-| 改坏 JSON | 中间行坏 → `parentId` 悬空 → 回溯静默终止，后续历史消失 | §6.4 的写前全量 `parentId` 校验 + 写后回读校验 + 备份 |
-| 编辑后未重载就继续提问 | 自动重载成功时不会发生；重载被 cancel / 抛错时模型与界面仍为旧内容 | §6.4.8 的降级提示 |
-| 编辑后未重载就 `/fork` | 同上（新文件从**内存**写出，带旧文本） | 同上 |
-| 每次编辑都触发 `session_shutdown` + `session_start` | 其他扩展（如 magic-context）重建自己的状态；大 session 有短暂重建耗时 | 与真 `/resume` 完全同路径，不再额外处理 |
-| 改 assistant 的 content 丢 toolCall | provider 报 tool_result 无对应 tool_use | §6.3 强制保留非 text block |
+| 破坏 append-only | 与设计约定不符 | 零 await 同步块 + psm-log + 文档写明 |
+| 原文/被删内容 | 不可从 session 文件找回 | `psm-log` 逐条记录（含父指针），可精确还原 |
+| 改坏 JSON | 中间行坏 → `parentId` 悬空 → 回溯静默终止，后续历史消失 | §6.6 写前全量 `parentId` 校验 + 写后回读校验 |
+| 删到 `compaction.firstKeptEntryId` | 那段时间静默不进上下文 | §6.5 检测到就拒绝删除 |
+| 删除后出现分支合并 | 区间内分支点的子节点一起上挂，树形变了 | 结构合法，不影响加载；风险表已知即可 |
+| 改 assistant 的 content 丢 toolCall | provider 报 tool_result 无对应 tool_use | §6.4 强制保留非 text block |
+| 重载被 cancel / 抛错 | 文件已改但内存仍旧，模型与界面不一致 | §6.7 降级提示手工 `/resume` |
+| 每次操作都触发 `session_shutdown` + `session_start` | 其他扩展（如 magic-context）重建状态；大 session 有短暂重建耗时 | 与真 `/resume` 完全同路径，不再额外处理 |
 | 压缩后 entry 位置变化 | 目标行还在，不影响按 id 定位 | — |
 
-### 7.3 不解决的问题
+### 7.3 明确不做
 
-- **`context_edit` 与文件改动混用**：如果目标 entry 已有 `context_edit`，改文件会改原文，但模型看到的仍是 `context_edit` 的 replacement（后者覆盖）。UI 上要提示。
-- **图片内容**：编辑后如何保留/丢弃，见 §8。
-- **跨分支编辑**：`getBranch()` 只含活动分支。要改别的分支的 entry，需要先 `/tree` 过去。
+- **插入新消息**：需要在 B 与 C 之间插一条并改 C 的 `parentId`，风险与删除同级但收益低；`/tree` 跳回去重问已覆盖“从这里重开”
+- **删除单条**：只按轮删（单条删容易断 toolCall/toolResult 配对）
+- **编辑 `custom_message`**：它属于删除范畴，不属于编辑
+- **删除或编辑区间内的 bookkeeping 条目**（`usage` / `model_change` / `label` / `custom` / `session_info`）
+- **跨分支操作**：`getBranch()` 只含活动分支，要动别的分支先 `/tree` 过去
+- **记住上次位置**：一次调用只完成一件事，结束后不保留状态
+- **多进程同文件**：pi 对 session 文件不加锁，不在支持范围
+- **`context_edit` 与文件改动混用**：若目标已有 `context_edit`，改文件只改了原文，模型看到的仍是 replacement（后者覆盖）；UI 上标一个记号提醒
 
 ---
 
-## 8. 待定问题
+## 8. 已定决策
 
-1. **列表排序**：最新在上（符合"改最近的东西"直觉）还是最旧在上（符合时间线阅读）？
-2. **图片内容**：编辑含图片的消息时，保留图片 / 丢弃并提示 / 拒绝编辑？
-3. **备份策略**：每次改都备份（会攒文件）？还是只保留最近 N 个 / 只备份一次（`.bak-original`）？
-4. **是否也提供"追加一条新消息"**：编辑之外，另一个常见需求是在历史里插入一句更正。技术上等于在目标位置插一行并重连 `parentId`，属于同类操作但风险更高。
-5. **是否要记住上次编辑的位置**（重载后回到同一处，方便连续改多条）。
+| 项 | 决定 |
+|---|---|
+| 可编辑集合 | `user` / `assistant` / `toolResult`（已含 `custom_message` 以外的全部模型可见角色） |
+| 列表排序 | 正序（旧在上、最新在下），初始选中最后一条 |
+| 图片 | 原样保留，编辑器标题提示 |
+| 备份 | 旁挂单行日志 `<session>.psm-log`（不整文件快照） |
+| 插入新消息 | 不做 |
+| 记住上次位置 | 不做 |
+| 删除 | 真删（界面也消失）· 按轮 · 列表仅 `user` · bookkeeping 保留重连 |
+| 命令 | `/psm-edit`、`/psm-remove` |
+| 生效方式 | 自动 `switchSession` 重载，失败降级提示手工 `/resume` |
 
 ---
 
