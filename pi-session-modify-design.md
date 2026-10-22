@@ -410,7 +410,19 @@ value:        entry.id
 
 - 只列**当前分支**上的（`getBranch()` 已经保证）
 - 已存在 `context_edit` 指向它的，标一个记号（避免困惑）
-- `ctx.ui.select(title, string[])` 只能给纯字符串、无搜索；要 label + description 双列 + 子串搜索，必须走 `ctx.ui.custom` + `Input` + `SelectList`（参照 `model-selector.ts` 的搜索框写法）
+
+**列表组件：`ctx.ui.custom` + 自建窗口化列表（不做搜索）。**
+
+`ctx.ui.select` 不能用 —— 它的实现（`ExtensionSelectorComponent`）把每个选项都 `addChild(new Text(...))`，**没有任何滚动窗口**（`extension-selector.ts:86-94`）。实测：传 200 项，敲 20 次 `j` 后回车选中 `21. item 21`，而屏幕仍停在 `1. item 1` 开头 —— 光标出屏后完全盲选。
+
+pi 自己的长列表（`/tree` → `TreeSelectorComponent` + `showSelector`，`interactive-mode.ts:5543,4853`；`/resume`、`/model` 同样）全是自建组件 + 窗口切片（`tree-selector.ts:682-686`）。我们照做，只要最简形态：
+
+```
+窗口大小 = max(5, min(15, floor(rows * 0.4)))
+start    = clamp(selectedIndex - floor(window / 2), 0, len - window)
+按键     = ↑↓ / j k / PgUp PgDn / g G / Enter / Esc
+边框     = ──── ↑ N ──── （隐藏行数）    底部行 = (selected/total)
+```
 
 ### 6.4 编辑：改写细节（按 role 分支）
 
@@ -554,6 +566,7 @@ value:        entry.id
 | 列表排序 | 正序（旧在上、最新在下），初始选中最后一条 |
 | 图片 | 原样保留，编辑器标题提示 |
 | 编辑界面 | `ctx.ui.editor`（pi 自己的 Editor）+ Ctrl+G 外部编辑器逃生口；不做查找/片段替换 |
+| 列表组件 | `ctx.ui.custom` + 自建窗口化列表（`ctx.ui.select` 无滚动，实测盲选）；不做搜索 |
 | 备份 | 旁挂单行日志 `<session>.psm-log`（不整文件快照） |
 | 插入新消息 | 不做 |
 | 记住上次位置 | 不做 |
