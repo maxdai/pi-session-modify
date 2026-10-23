@@ -654,6 +654,24 @@ ln -s /root/pi-session-modify ~/.pi/agent/extensions/session-modify  # 常驻
 - 每次重载会让 pi 追加一条 `thinking_level_change` entry（bookkeeping，不影响上下文），它不计入列表计数，也不会被删除
 - 若目标 entry 已带 `context_edit`，改文件只改原文；模型看到的仍是 replacement（UI 尚未标记号，见 §7.3）
 - `psm-log` 与 `<file>.psm-tmp` 都在 session 同目录；`.psm-log` / `.psm-tmp` 不以 `.jsonl` 结尾，不会被 `/resume` 扫到
+- 重载结果无条件写入 `psm-log`：`{"op":"reload","outcome":"ok|cancelled|error: …"}`。重载死掉时旧 ctx 已失效，提示走不出去，日志是唯一可查的证据
+
+### 10.6 在 pi-web（RPC 模式）下运行
+
+pi-web 通过 `pi --mode rpc` 子进程 + 注入桥接扩展工作，两条界面通道都与 TUI 不同：
+
+| | TUI | RPC（pi-web） |
+|---|---|---|
+| 重载成功提示 | `showStatus("Resumed session")`（`interactive-mode.ts:5737`） | 无此提示 |
+| 界面重画 | `rebindCurrentSession({renderBeforeBind:true})` → `renderCurrentSessionState()` | **不会自动发生** |
+
+`rpc-mode.ts:313` 的 `setRebindSession` 只重新绑定扩展、重订阅事件，**不通知客户端**；`AgentSessionEvent` 联合类型里也没有会话切换事件。所以扩展在进程内调 `ctx.switchSession()` 后，模型上下文已更新（已验证：探针命令返回 `{cancelled:false}` 且 `withSession` 被调用），但浏览器仍显示旧 transcript —— 只有断开重连（刷新页面）才会重放快照。
+
+**pi-web 侧的修复**：`@maxdai/pi-web` ≥ 1.2.10 —— 桥接扩展在 `session_start`（reason ≠ `startup`）时 `POST /side/event {type:"session-changed"}`，服务端据此作废旧对话框、清空 widget/ext_status 快照，再按顺序重发 `state` + `history`。
+
+推论：
+- 低于 1.2.10 的 pi-web：修改生效但页面不刷新，手工刷新浏览器页面即可（无需重启 pi）
+- 我们的成功 `notify` 在 pi-web 下会渲染成模态对话框（命令期间产生的 notify 被前端按 `/` 标题处理）
 
 ---
 
